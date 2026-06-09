@@ -1,12 +1,23 @@
-import crypto from "crypto";
 import process from "process";
 import questpay from "../config/questpay.js";
 import TransactionModel from "../models/transactions.model.js";
 import UserModel from "../models/user.model.js";
-import { Buffer } from "buffer";
+import {
+  buildReconcileDataFromVerify,
+  reconcileFailure,
+  reconcilePayment,
+  verifyQuestpaySignature,
+} from "../services/reconcilePayment.js";
 
 const apiKey =
   process.env.QUESTPAY_API_KEY || process.env.QUESTPAY_SECRET_KEY;
+
+const formatTransaction = (transaction) => ({
+  reference: transaction.reference,
+  amount: transaction.amount,
+  email: transaction.email,
+  status: transaction.status,
+});
 
 export const initiatePayment = async (req, res) => {
   try {
@@ -76,7 +87,7 @@ export const initiatePayment = async (req, res) => {
 export const verifyPayment = async (req, res) => {
   try {
     const { reference } = req.params;
-    const transaction = await TransactionModel.findOne({ reference });
+    let transaction = await TransactionModel.findOne({ reference });
 
     if (!transaction) {
       return res.status(404).json({
@@ -91,12 +102,7 @@ export const verifyPayment = async (req, res) => {
         success: true,
         message: "Payment confirmed",
         status: "success",
-        transaction: {
-          reference: transaction.reference,
-          amount: transaction.amount,
-          email: transaction.email,
-          status: transaction.status,
-        },
+        transaction: formatTransaction(transaction),
       });
     }
 
@@ -105,12 +111,7 @@ export const verifyPayment = async (req, res) => {
         success: false,
         message: "Payment was not completed",
         status: "failed",
-        transaction: {
-          reference: transaction.reference,
-          amount: transaction.amount,
-          email: transaction.email,
-          status: transaction.status,
-        },
+        transaction: formatTransaction(transaction),
       });
     }
 
@@ -118,33 +119,43 @@ export const verifyPayment = async (req, res) => {
       const { data: questpayRes } = await questpay.get(
         `/v1/checkout/verify/${reference}`,
       );
-      const remoteStatus = questpayRes?.data?.status;
+      const verifyData = questpayRes?.data;
+      const remoteStatus = verifyData?.status;
 
       if (remoteStatus === "success") {
+        const reconcileData = buildReconcileDataFromVerify(
+          verifyData,
+          transaction,
+        );
+        await reconcilePayment(reconcileData);
+        transaction = await TransactionModel.findOne({ reference });
+
+        if (transaction?.status === "success") {
+          return res.status(200).json({
+            success: true,
+            message: "Payment confirmed",
+            status: "success",
+            transaction: formatTransaction(transaction),
+          });
+        }
+
         return res.status(200).json({
-          success: true,
-          message: "Payment confirmed",
-          status: "success",
-          transaction: {
-            reference: transaction.reference,
-            amount: transaction.amount,
-            email: transaction.email,
-            status: "pending",
-          },
+          success: false,
+          message: "Payment verification in progress",
+          status: "pending",
+          transaction: formatTransaction(transaction),
         });
       }
 
       if (remoteStatus === "failed") {
+        await reconcileFailure({ reference });
+        transaction = await TransactionModel.findOne({ reference });
+
         return res.status(200).json({
           success: false,
           message: "Payment was not completed",
           status: "failed",
-          transaction: {
-            reference: transaction.reference,
-            amount: transaction.amount,
-            email: transaction.email,
-            status: "failed",
-          },
+          transaction: formatTransaction(transaction),
         });
       }
     } catch (verifyError) {
@@ -158,12 +169,7 @@ export const verifyPayment = async (req, res) => {
       success: false,
       message: "Payment is still pending",
       status: "pending",
-      transaction: {
-        reference: transaction.reference,
-        amount: transaction.amount,
-        email: transaction.email,
-        status: transaction.status,
-      },
+      transaction: formatTransaction(transaction),
     });
   } catch (error) {
     console.error("Verify payment error:", error.message);
@@ -174,106 +180,35 @@ export const verifyPayment = async (req, res) => {
   }
 };
 
-const timingSafeEqual = (a, b) => {
-  const bufA = Buffer.from(a, "utf8");
-  const bufB = Buffer.from(b, "utf8");
-  if (bufA.length !== bufB.length) return false;
-  return crypto.timingSafeEqual(bufA, bufB);
-};
-
-const creditUserFromWebhook = async (data) => {
-  const reference = data.reference;
-  const existing = await TransactionModel.findOne({ reference });
-
-  if (existing?.status === "success") {
-    return { duplicate: true };
-  }
-
-  const userId = data.metadata?.userId;
-  let user = userId ? await UserModel.findById(userId) : null;
-
-  if (!user && data.customer?.email) {
-    user = await UserModel.findOne({
-      email: data.customer.email.toLowerCase(),
-    });
-  }
-
-  if (!user) {
-    console.error("Webhook: user not found for reference", reference);
-    return { error: "user_not_found" };
-  }
-
-  const creditAmount = data.fees?.netAmount ?? data.amount;
-  const balanceBefore = user.balance;
-
-  await UserModel.creditBalance(user.id, creditAmount);
-  const updatedUser = await UserModel.findById(user.id);
-
-  if (existing) {
-    existing.status = "success";
-    existing.amount = creditAmount;
-    existing.balanceBefore = balanceBefore;
-    existing.balanceAfter = updatedUser.balance;
-    await existing.save();
-  } else {
-    await TransactionModel.create({
-      userId: user.id,
-      email: user.email,
-      amount: creditAmount,
-      reference,
-      status: "success",
-      description: data.checkout?.description || "Wallet top-up",
-      balanceBefore,
-      balanceAfter: updatedUser.balance,
-    });
-  }
-
-  return { credited: true, userId: user.id, amount: creditAmount };
-};
-
-const failCheckout = async (data) => {
-  const reference = data.reference;
-  const transaction = await TransactionModel.findOne({ reference });
-  if (!transaction || transaction.status === "success") return;
-
-  transaction.status = "failed";
-  await transaction.save();
-};
-
 export const handleQuestpayWebhook = async (req, res) => {
   try {
-    const signature = req.headers["x-questpay-signature"];
-    const payload = req.body.toString("utf8");
-
-    if (!signature || !apiKey) {
-      console.error("Webhook: missing signature or API key");
+    if (!verifyQuestpaySignature(req, apiKey)) {
+      console.error("[questpay:webhook] signature=fail");
       return res.status(400).send("Invalid signature");
     }
 
-    const calculated = crypto
-      .createHmac("sha256", apiKey)
-      .update(payload)
-      .digest("hex");
+    console.log("[questpay:webhook] signature=pass");
 
-    if (!timingSafeEqual(calculated, signature)) {
-      console.error("Webhook: invalid signature");
-      return res.status(400).send("Invalid signature");
-    }
+    const event =
+      req.headers["x-questpay-event"] || req.body?.event || "unknown";
+    const data = req.body?.data;
+    const grossAmount = data ? (data.payment?.amountPaid ?? data.fees?.grossAmount ?? data.amount) : undefined;
 
-    const body = JSON.parse(payload);
-    const { event, data } = body;
+    console.log(
+      `[questpay:webhook] event=${event} reference=${data?.reference ?? "n/a"} amountPaid=${grossAmount ?? "n/a"} netAmount=${data?.fees?.netAmount ?? "n/a"}`,
+    );
 
     if (event === "payment.received" && data?.status === "success") {
-      await creditUserFromWebhook(data);
+      await reconcilePayment(data);
     } else if (event === "checkout.failed") {
-      await failCheckout(data);
+      await reconcileFailure(data);
     } else {
-      console.warn("Webhook: unhandled event", event);
+      console.warn(`[questpay:webhook] unhandled event=${event}`);
     }
 
     return res.status(200).send("OK");
   } catch (error) {
-    console.error("Webhook error:", error.message);
-    return res.status(500).send("Webhook processing failed");
+    console.error("[questpay:webhook] error:", error.message);
+    return res.status(200).send("OK");
   }
 };

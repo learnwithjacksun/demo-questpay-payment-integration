@@ -2,7 +2,7 @@ import ModeToggle from "@/components/ui/mode-toggle";
 import { formatNumber } from "@/helpers/formatNumber";
 import { useVerifyPayment } from "@/hooks";
 import { CheckCircle2, Clock, Loader2, XCircle } from "lucide-react";
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 
 const POLL_INTERVAL_MS = 5000;
@@ -11,31 +11,33 @@ export default function PaymentCallback() {
   const [searchParams] = useSearchParams();
   const reference =
     searchParams.get("reference") || searchParams.get("ref") || "";
+  const checkoutStatus = searchParams.get("checkout_status");
   const { verifyPayment, isVerifying, result } = useVerifyPayment();
 
+  const redirectFailed = checkoutStatus === "failed";
+
   useEffect(() => {
+    if (!reference || redirectFailed) return;
 
-    if (!reference) return;
-
-    const runVerify = async () => {
-      const data = await verifyPayment(reference);
+    const stopIfDone = (data: { success: boolean; status?: string }) => {
       if (data.success || data.status === "failed") {
-        if (intervalId) clearInterval(intervalId);
+        clearInterval(intervalId);
       }
     };
-    let intervalId = setInterval(runVerify, POLL_INTERVAL_MS);
-    
 
+    void verifyPayment(reference).then(stopIfDone);
 
-    runVerify();
-    intervalId = setInterval(runVerify, POLL_INTERVAL_MS);
+    const intervalId = setInterval(() => {
+      void verifyPayment(reference).then(stopIfDone);
+    }, POLL_INTERVAL_MS);
 
-    return () => {
-      if (intervalId) clearInterval(intervalId);
-    };
-  }, [reference, verifyPayment]);
+    return () => clearInterval(intervalId);
+  }, [reference, redirectFailed, verifyPayment]);
 
-  const status = result?.status ?? (isVerifying ? "pending" : undefined);
+  const status = useMemo(() => {
+    if (redirectFailed) return "failed";
+    return result?.status ?? (isVerifying ? "pending" : undefined);
+  }, [redirectFailed, result?.status, isVerifying]);
 
   return (
     <div className="min-h-dvh py-20">
@@ -53,7 +55,7 @@ export default function PaymentCallback() {
           </>
         )}
 
-        {reference && isVerifying && !result && (
+        {reference && !redirectFailed && isVerifying && !result && (
           <>
             <Loader2 className="mx-auto animate-spin text-primary" size={48} />
             <h2 className="text-xl font-semibold">Verifying payment...</h2>
@@ -61,12 +63,12 @@ export default function PaymentCallback() {
           </>
         )}
 
-        {reference && result && status === "success" && (
+        {reference && status === "success" && (
           <>
             <CheckCircle2 className="mx-auto text-green-500" size={48} />
             <h2 className="text-xl font-semibold">Payment confirmed</h2>
-            <p className="text-sm text-muted">{result.message}</p>
-            {result.transaction && (
+            <p className="text-sm text-muted">{result?.message}</p>
+            {result?.transaction && (
               <div className="border border-line rounded-xl p-4 text-left space-y-2">
                 <p className="text-sm">
                   <span className="text-muted">Amount:</span> NGN{" "}
@@ -85,7 +87,7 @@ export default function PaymentCallback() {
           </>
         )}
 
-        {reference && result && status === "pending" && (
+        {reference && status === "pending" && !redirectFailed && (
           <>
             {isVerifying ? (
               <Loader2 className="mx-auto animate-spin text-amber-500" size={48} />
@@ -94,18 +96,23 @@ export default function PaymentCallback() {
             )}
             <h2 className="text-xl font-semibold">Payment pending</h2>
             <p className="text-sm text-muted">
-              {result.message}. If you paid by bank transfer, confirmation can
-              take a few minutes. This page will update automatically.
+              {result?.message ?? "Waiting for confirmation"}. If you paid by
+              bank transfer, confirmation can take a few minutes. This page will
+              update automatically.
             </p>
             <p className="text-sm text-muted">Reference: {reference}</p>
           </>
         )}
 
-        {reference && result && status === "failed" && (
+        {reference && status === "failed" && (
           <>
             <XCircle className="mx-auto text-red-500" size={48} />
             <h2 className="text-xl font-semibold">Payment not completed</h2>
-            <p className="text-sm text-muted">{result.message}</p>
+            <p className="text-sm text-muted">
+              {redirectFailed
+                ? "Checkout timed out or was cancelled. You can try again from your wallet."
+                : result?.message}
+            </p>
           </>
         )}
 

@@ -26,11 +26,7 @@ app.use(cors(corsOptions));
 
 const webhookPath =
   process.env.QUESTPAY_WEBHOOK_PATH || "/webhooks/questpay";
-app.post(
-  webhookPath,
-  express.raw({ type: "application/json" }),
-  handleQuestpayWebhook,
-);
+app.post(webhookPath, express.json(), handleQuestpayWebhook);
 
 app.use(express.json());
 

@@ -38,7 +38,25 @@ const transactionSchema = new Schema(
     balanceAfter: {
       type: Number,
       required: true,
-    }
+    },
+    amountPaid: {
+      type: Number,
+    },
+    netAmount: {
+      type: Number,
+    },
+    platformFee: {
+      type: Number,
+    },
+    providerTransactionId: {
+      type: String,
+    },
+    processedAt: {
+      type: Date,
+    },
+    reconciliationNote: {
+      type: String,
+    },
   },
   {
     timestamps: true,
